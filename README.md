@@ -23,7 +23,7 @@ Navigator                Local dashboard at localhost:4100
 ## Setup
 
 ```bash
-git clone https://github.com/ToknWrks/trader
+git clone https://github.com/hoolibear/trader
 cd trader
 npm install
 npm run setup

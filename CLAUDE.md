@@ -6,7 +6,7 @@ Standalone local trading agent for [agentsignal.app](https://agentsignal.app) st
 Fetches live signals via x402, detects flips, and executes market orders on Hyperliquid perps.
 Your private key never leaves your machine.
 
-- **Repo**: `github.com/ToknWrks/trader`
+- **Repo**: `github.com/hoolibear/trader`
 - **AgentSignal app**: `/Users/lancepitman/AgentSignal/` (separate repo)
 - **Dashboard**: `http://localhost:4100` (run `npm run dashboard`) — listens on 127.0.0.1 only
 - **Desktop app**: `npm run app:build` → `dist/mac-arm64/AgentSignal Trader.app` (spec: `docs/electron-app.md`)
