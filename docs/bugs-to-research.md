@@ -159,12 +159,32 @@ Also fixed: the strategies page treated `ENTERED SHORT` as a long.
 
 ---
 
+## 9. Server signal closed a position whose exit rules were not met (fixed 2026-11-11)
+
+**What happened.** 2026-11-11 18:06 UTC: NEAR Mean Reversion closed 20.7 NEAR at $3.7375 for
+-$12.80. Its long exit rule needs RSI(14, 4h) >= 80 AND price >= 10% above entry. Actual: RSI
+about 56.7, price 14% below entry ($4.356).
+
+**Cause.** A run gets its signal from the local check first and falls back to the server. The
+local check knows a position is open and tests only the exit rule. The server does not: it
+reports whether the entry rule (RSI <= 45) is true now, so it said FLAT. At 18:00 the local
+check failed without logging anything, the run fell back to the server six minutes later, and
+the engine treated LONG -> FLAT as an exit. The fallback predates the 2026-11-10 work; the old
+cooldown guard on exits may have hidden it.
+
+**Fix.** With a position open and no local check, the run holds: nothing is closed, alert
+`local_check_failed` is raised, the stop and trail upkeep still run, and the next run tries
+again. The server signal is still used when flat (entries) and for strategies with no exit
+rules of their own. Local check failures now log their reason. Five tests cover it.
+
+**Not known.** Why the local check failed at 18:00 (network drop or the Mac sleeping are the
+likely causes).
+
 ## Still open
 
 1. **Live stop-order check.** Place one stop with the new price format at minimum size, confirm
    Hyperliquid accepts it, cancel it. Needs your go-ahead: real order on the real account.
-2. **Live NEAR position.** 12.7 NEAR long from $4.728, 3x isolated, no stop. The fixed trader
-   leaves it alone and shows an alert. Close it or set a stop by hand.
+2. ~~Live NEAR position.~~ Closed 2026-11-11 by bug 9 above.
 3. **Vault x402 payment** untested (item 5).
 4. **Balance pre-flight check** and **exchange-error circuit breaker**: not in this work.
 5. **Shared positions.** Two strategies on the same asset share one exchange position and would

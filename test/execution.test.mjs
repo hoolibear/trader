@@ -252,3 +252,84 @@ test("signal fetch alert clears as soon as any signal arrives", async () => {
   await run(s, ex, "FLAT");
   assert.deepEqual(openAlerts(s.id), []);
 });
+
+// ── Server signal must not close a position that has its own exit rules ───────
+// 2026-11-11: the local check failed once, the run fell back to the server,
+// the server said FLAT (entry rule not true), and a NEAR long was closed with
+// neither exit condition met.
+
+const NEAR_DEF = {
+  risk: { mode: "scalp" },
+  long_entry: { operator: "AND", conditions: [{ op: "lte", field: "rsi", value: 45, period: 14, interval: "4h" }] },
+  long_exit:  { operator: "AND", conditions: [
+    { op: "gte", field: "rsi", value: 80, period: 14, interval: "4h" },
+    { op: "gte", field: "pct_above_entry", value: 10 },
+  ] },
+};
+const serverSays = signal => { const f = async () => { f.calls++; return { signal, price: 3.74 }; }; f.calls = 0; return f; };
+const runLive = (strategy, exchange, def, fetchSignal) =>
+  runStrategyOnce(db.getStrategy(strategy.id), { exchange, def, fetchSignal });
+
+test("local exit check fails with a position open: hold, never ask the server, alert", async () => {
+  const s = makeStrategy(db);
+  const ex = new FakeExchange({ mid: 3.74, szi: 20.7, entryPx: 4.356 });
+  ex.getCandles = async () => { throw new Error("network down"); };
+  db.upsertSignal({ strategy_id: s.id, date: "2026-11-11", signal: "LONG", price: 3.78, notes: null });
+  const server = serverSays("FLAT");
+  const r = await runLive(s, ex, NEAR_DEF, server);
+  assert.equal(r.ok, true);
+  assert.equal(r.held, true);
+  assert.equal(ex.szi, 20.7, "position untouched");
+  assert.equal(ex.count("close"), 0);
+  assert.equal(ex.count("market"), 0);
+  assert.equal(server.calls, 0, "server signal not fetched");
+  assert.equal(db.getLatestSignal(s.id).signal, "LONG", "stored signal unchanged");
+  assert.deepEqual(openAlerts(s.id), ["local_check_failed"]);
+});
+
+test("strategy rules not loaded with a position open: hold", async () => {
+  const s = makeStrategy(db);
+  const ex = new FakeExchange({ mid: 3.74, szi: 20.7, entryPx: 4.356 });
+  const server = serverSays("FLAT");
+  const r = await runLive(s, ex, null, server);
+  assert.equal(r.held, true);
+  assert.equal(ex.szi, 20.7);
+  assert.equal(server.calls, 0);
+  assert.deepEqual(openAlerts(s.id), ["local_check_failed"]);
+});
+
+test("local exit check works again: alert clears, exit rule not met so still holding", async () => {
+  const s = makeStrategy(db);
+  const ex = new FakeExchange({ mid: 3.74, szi: 20.7, entryPx: 4.356 });
+  db.raiseAlert({ strategy_id: s.id, code: "local_check_failed", message: "x", level: "warning" });
+  ex.getCandles = async () => Array.from({ length: 100 }, (_, i) => ({ c: String(3.7 + (i % 2) * 0.02) }));
+  const server = serverSays("FLAT");
+  const r = await runLive(s, ex, NEAR_DEF, server);
+  assert.equal(r.signal, "LONG");
+  assert.equal(ex.szi, 20.7);
+  assert.equal(server.calls, 0);
+  assert.deepEqual(openAlerts(s.id), []);
+});
+
+test("no position: server signal is still used for entries", async () => {
+  const s = makeStrategy(db);
+  const ex = new FakeExchange({ mid: 3.74 });
+  ex.getCandles = async () => { throw new Error("network down"); };
+  const server = serverSays("FLAT");
+  const r = await runLive(s, ex, NEAR_DEF, server);
+  assert.equal(server.calls, 1);
+  assert.equal(r.signal, "FLAT");
+  assert.deepEqual(openAlerts(s.id), []);
+});
+
+test("strategy with no exit rules of its own: server FLAT still closes the position", async () => {
+  const s = makeStrategy(db);
+  const ex = new FakeExchange({ mid: 4.0 });
+  await run(s, ex, "LONG");
+  assert.ok(ex.szi > 0);
+  const server = serverSays("FLAT");
+  const r = await runLive(s, ex, PLAIN, server);
+  assert.equal(server.calls, 1);
+  assert.equal(ex.szi, 0);
+  assert.match(r.action, /^CLOSED /);
+});

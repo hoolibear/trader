@@ -218,16 +218,75 @@ function computeATR(candles, period = 14) {
 export async function fetchStrategyDef(strategyId) {
   try {
     const res = await fetch(`${getSignalUrl()}/api/strategy/${strategyId}`);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[trader] Strategy rules not loaded for ${strategyId}: HTTP ${res.status}`);
+      return null;
+    }
     return await res.json();
-  } catch { return null; }
+  } catch (e) {
+    console.warn(`[trader] Strategy rules not loaded for ${strategyId}: ${e.message}`);
+    return null;
+  }
+}
+
+// Fields the local check can evaluate by itself.
+const PRICE_FIELDS       = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
+const INDICATOR_FIELDS   = new Set(["rsi", "sma", "ema"]);
+const PASSTHROUGH_FIELDS = new Set(["pct_above_entry", "pct_below_entry"]);
+const KNOWN_FIELDS       = new Set([...PRICE_FIELDS, ...INDICATOR_FIELDS, ...PASSTHROUGH_FIELDS]);
+
+/**
+ * True when the strategy has exit rules for the held side that this machine can
+ * evaluate by itself. For such a position the local check is the ONLY authority
+ * on exits: the server's signal does not know a position is open (it reports
+ * whether the entry rule is true right now), so its FLAT is not an exit.
+ */
+export function hasOwnExitRules(def, isLong, exchange) {
+  try {
+    const parse = v => typeof v === "string" ? JSON.parse(v) : v;
+    const has   = r => r?.conditions?.length > 0;
+    const rules = isLong
+      ? (has(parse(def?.long_exit)) ? parse(def.long_exit) : parse(def?.exit))
+      : parse(def?.short_exit);
+    if (!has(rules)) return false;
+    const fields = rules.conditions.map(c => (c.field ?? "close").toLowerCase());
+    if (!fields.every(f => KNOWN_FIELDS.has(f))) return false;
+    // An exchange with no candle data cannot run indicator rules; the server decides there.
+    if (fields.some(f => INDICATOR_FIELDS.has(f)) && exchange && typeof exchange.getCandles !== "function") return false;
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * Called when the local check produced nothing. Returns null when it is safe to
+ * fall back to the server's signal, or { reason, exchange? } when the run must
+ * hold instead: a position is open (or cannot be read) and the server's signal
+ * must not be allowed to close it.
+ */
+async function mustHoldWithoutLocalCheck(strategy, def, exchangeIn) {
+  let exchange, position;
+  try {
+    exchange = exchangeIn ?? await getExchange(strategy);
+    position = await withRetry(() => exchange.getPosition(assetOf(strategy)));
+  } catch (e) {
+    return { reason: `the position could not be read from the exchange (${e.message}), so no signal was acted on` };
+  }
+  const szi = parseFloat(position?.szi ?? "0");
+  if (szi === 0) return null;
+  const side = szi > 0 ? "long" : "short";
+  if (!def) return { exchange, reason: `the strategy's rules could not be loaded, so the exit check for the open ${side} did not run` };
+  if (hasOwnExitRules(def, szi > 0, exchange)) return { exchange, reason: `the exit check for the open ${side} could not run` };
+  return null;
 }
 
 // ── Local eval — price thresholds + candle indicators (no x402) ──────────────
 
 export async function tryLocalEval(strategy, def, exchangeIn) {
   try {
-    if (!def) return null;
+    if (!def) {
+      console.warn(`[trader] Local eval skipped for ${strategy.name}: strategy rules not loaded`);
+      return null;
+    }
     const parse = v => typeof v === "string" ? JSON.parse(v) : v;
 
     const risk = parse(def.risk) ?? {};
@@ -244,10 +303,9 @@ export async function tryLocalEval(strategy, def, exchangeIn) {
     ];
     if (!allConds.length) return null;
 
-    const priceFlds     = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
-    const indicatorFlds = new Set(["rsi", "sma", "ema"]);
-    const passthroughFlds = new Set(["pct_above_entry", "pct_below_entry"]);
-    const knownFlds     = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
+    const indicatorFlds   = INDICATOR_FIELDS;
+    const passthroughFlds = PASSTHROUGH_FIELDS;
+    const knownFlds       = KNOWN_FIELDS;
 
     const asset    = assetOf(strategy);
     const exchange = exchangeIn ?? await getExchange(strategy);
@@ -257,7 +315,10 @@ export async function tryLocalEval(strategy, def, exchangeIn) {
       withRetry(() => exchange.getMidPrice(asset)),
       withRetry(() => exchange.getPosition(asset)),
     ]);
-    if (!price) return null;
+    if (!price) {
+      console.warn(`[trader] Local eval failed for ${strategy.name}: no price from the exchange`);
+      return null;
+    }
 
     const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
     const isLong      = parseFloat(position?.szi ?? "0") > 0;
@@ -1064,10 +1125,27 @@ async function runStrategyOnceUnlocked(strategy, deps = {}) {
     sl_pct:    strategy.sl_pct_adaptive ?? baseSlPct,
   };
 
-  // Try local candle/indicator eval first, fall back to x402 fetch
-  const signalData = deps.signalData
-    ?? await tryLocalEval(effectiveStrategy, def, deps.exchange)
-    ?? await fetchSignal(effectiveStrategy);
+  // Try local candle/indicator eval first, fall back to the server's signal.
+  let signalData = deps.signalData ?? await tryLocalEval(effectiveStrategy, def, deps.exchange);
+  if (signalData) {
+    clearAlert(strategy, "local_check_failed");
+  } else {
+    // The server's signal does not know about our position: for a strategy with
+    // its own exit rules it answers "is the entry rule true now?", so FLAT there
+    // is not an exit. Acting on it closed a NEAR long on 2026-11-11 with neither
+    // exit condition met. With a position open and no local check: hold.
+    const hold = await mustHoldWithoutLocalCheck(effectiveStrategy, def, deps.exchange);
+    if (hold) {
+      alert(strategy, "local_check_failed",
+        `${strategy.name}: ${hold.reason}. Nothing was closed. It will be checked again on the next run.`, "warning");
+      if (hold.exchange) {
+        try { await maintainPosition(effectiveStrategy, hold.exchange); }
+        catch (e) { console.warn(`[trader] Position upkeep failed for ${strategy.name}: ${e.message}`); }
+      }
+      return { ok: true, held: true, signal: getLatestSignal(strategy.id)?.signal ?? null, action: "Exit check unavailable — holding position" };
+    }
+    signalData = await (deps.fetchSignal ?? fetchSignal)(effectiveStrategy);
+  }
   if (!signalData) {
     return { ok: false, error: "Could not fetch signal", fetchFailed: true };
   }

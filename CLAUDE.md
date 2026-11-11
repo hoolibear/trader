@@ -124,6 +124,7 @@ L1 (RSI band) and L2 (EMA50) were removed on purpose — they blocked mean-rever
 - **Guards (cooldown, max size) apply to entries only.** Exits are never blocked.
 - **Prices to Hyperliquid go through `formatHlPrice()`** (5 significant figures, `6 − szDecimals` decimals). Never `toPrecision()` — a 6-figure trigger price is rejected as `Invalid TP/SL price`.
 - **Entry orders are not retried** (not idempotent). Closes are.
+- **The server signal never closes a position that has its own exit rules.** The server does not know a position is open; for scalpers its FLAT only means "entry rule not true now". Position open + local check unavailable (rules not loaded, no candles, no price) → hold, raise `local_check_failed`, retry next run. See `hasOwnExitRules()` / `mustHoldWithoutLocalCheck()`.
 - **Scalpers enter on signal + no position, no flip needed.** Signal events are `flip` only when the signal changed.
 - **TP/trail is direction-aware.** `tp_state.high_water` = best price seen (lowest for a short).
 - **Alerts** (`alerts` table) surface as a dashboard banner and desktop notifications.
