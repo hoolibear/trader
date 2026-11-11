@@ -1158,18 +1158,45 @@ async function portfolioPage() {
     try {
       const { CoinbaseExchange } = await import("./exchanges/coinbase.mjs");
       const cb = new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE);
-      const data = await cb._request("GET", "/api/v3/brokerage/accounts");
-      coinbaseAccounts = (data?.accounts ?? []).filter(a => parseFloat(a.available_balance?.value ?? "0") > 0.00001);
+      // Shown: every account with an available or held balance (all pages), plus
+      // staked holdings, which only the portfolio summary reports.
+      const balanceOf = a => parseFloat(a.available_balance?.value ?? "0") + parseFloat(a.hold?.value ?? "0");
+      const [allAccounts, holdings] = await Promise.all([
+        cb.listAccounts(),
+        cb.listPortfolioHoldings().catch(e => { console.error("[dashboard] Coinbase portfolio summary:", e.message); return []; }),
+      ]);
+      coinbaseAccounts = allAccounts.filter(a => balanceOf(a) > 0.00001);
+      // USD price per coin from Coinbase's own summary; order book only as a fallback
+      const summaryPrice = {};
+      for (const h of holdings) if (h.usd > 0 && h.amount > 0) summaryPrice[h.currency] = h.usd / h.amount;
       await Promise.all(coinbaseAccounts.map(async a => {
-        const avail = parseFloat(a.available_balance?.value ?? "0");
+        const total = balanceOf(a);
         if (a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT") {
-          coinbaseUsdValues[a.currency] = (coinbaseUsdValues[a.currency] ?? 0) + avail;
+          coinbaseUsdValues[a.currency] = (coinbaseUsdValues[a.currency] ?? 0) + total;
+        } else if (summaryPrice[a.currency] != null) {
+          coinbaseUsdValues[a.uuid] = total * summaryPrice[a.currency];
         } else {
           try {
-            coinbaseUsdValues[a.uuid] = avail * await cb.getMidPrice(a.currency);
+            coinbaseUsdValues[a.uuid] = total * await cb.getMidPrice(a.currency);
           } catch { coinbaseUsdValues[a.uuid] = null; }
         }
       }));
+      for (const h of holdings.filter(h => h.staked)) {
+        const uuid = `staked-${h.currency}`;
+        coinbaseAccounts.push({ uuid, currency: h.currency, staked: true, stakedAmount: h.amount,
+          available_balance: { value: "0" }, hold: { value: "0" } });
+        coinbaseUsdValues[uuid] = h.usd;
+      }
+      // Dust: drop rows Coinbase values under one cent (rows with no known price stay)
+      coinbaseAccounts = coinbaseAccounts.filter(a => {
+        const isUsd = !a.staked && (a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT");
+        const usd = isUsd ? balanceOf(a) : coinbaseUsdValues[a.uuid];
+        return usd == null || usd >= 0.01;
+      });
+      coinbaseAccounts.sort((a, b) => {
+        const v = x => (x.currency === "USD" || x.currency === "USDC" || x.currency === "USDT") ? balanceOf(x) : (coinbaseUsdValues[x.uuid] ?? 0);
+        return v(b) - v(a);
+      });
       // Coinbase open orders
       try {
         const cbOrders = await cb.getOpenOrders();
@@ -1372,16 +1399,17 @@ async function portfolioPage() {
         </div>
       </div>
       ${coinbaseAccounts.length > 0 ? `<div class="card"><table>
-        <thead><tr><th>Currency</th><th>Available</th><th>Hold</th><th>Value (USD)</th><th></th></tr></thead>
+        <thead><tr><th>Currency</th><th>Available</th><th>Hold / Staked</th><th>Value (USD)</th><th></th></tr></thead>
         <tbody>${coinbaseAccounts.map(a => {
           const avail = parseFloat(a.available_balance?.value ?? "0");
-          const hold  = parseFloat(a.hold?.value ?? "0");
-          const isUsd = a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT";
+          const hold  = a.staked ? a.stakedAmount : parseFloat(a.hold?.value ?? "0");
+          const isUsd = !a.staked && (a.currency === "USD" || a.currency === "USDC" || a.currency === "USDT");
           const usdVal = isUsd ? coinbaseUsdValues[a.currency] : coinbaseUsdValues[a.uuid];
+          const stakedTag = a.staked ? ` <span title="Staked on Coinbase — cannot be traded until unstaked" style="font-size:0.65rem;font-weight:600;padding:0.1rem 0.4rem;border-radius:4px;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.6)">Staked</span>` : "";
           const sellBtn = !isUsd && avail > 0 ? `<button class="btn btn-cyan" onclick="sellForUsdc('coinbase','${a.currency}',${avail},this)">→ USDC</button>` : "";
           return `<tr>
-            <td style="font-weight:600">${a.currency}</td>
-            <td>${avail.toFixed(3)}</td>
+            <td style="font-weight:600">${a.currency}${stakedTag}</td>
+            <td>${a.staked ? "—" : avail.toFixed(3)}</td>
             <td style="color:rgba(255,255,255,0.35)">${hold > 0 ? hold.toFixed(3) : "—"}</td>
             <td>${usdVal != null ? "$" + usdVal.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) : "—"}</td>
             <td>${sellBtn}</td>

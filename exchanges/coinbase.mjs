@@ -163,10 +163,52 @@ export class CoinbaseExchange {
     return (bid + ask) / 2;
   }
 
+  /**
+   * Every account, all pages. Coinbase returns 49 per page by default and an
+   * account exists for every currency ever listed, so one page misses most of them.
+   */
+  async listAccounts() {
+    const all = [];
+    let cursor = null;
+    for (let page = 0; page < 40; page++) {
+      const qs = `?limit=250${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const data = await this._request("GET", `/api/v3/brokerage/accounts${qs}`);
+      all.push(...(data?.accounts ?? []));
+      if (!data?.has_next || !data?.cursor) break;
+      cursor = data.cursor;
+    }
+    return all;
+  }
+
+  /**
+   * Holdings as Coinbase's portfolio summary reports them: one row per asset and
+   * account type, with the USD value. This is the only place staked balances
+   * appear (the account list shows them as 0 available, 0 hold).
+   * Returns [{ currency, amount, usd, tradable, staked }].
+   */
+  async listPortfolioHoldings() {
+    const out = [];
+    const list = await this._request("GET", "/api/v3/brokerage/portfolios");
+    for (const pf of list?.portfolios ?? []) {
+      const data = await this._request("GET", `/api/v3/brokerage/portfolios/${pf.uuid}`);
+      for (const p of data?.breakdown?.spot_positions ?? []) {
+        const amount = parseFloat(p.total_balance_crypto ?? "0");
+        if (!(amount > 0)) continue;
+        out.push({
+          currency: p.asset,
+          amount,
+          usd:      parseFloat(p.total_balance_fiat ?? "0") || 0,
+          tradable: parseFloat(p.available_to_trade_crypto ?? "0") || 0,
+          staked:   /STAKED/i.test(p.account_type ?? ""),
+        });
+      }
+    }
+    return out;
+  }
+
   async getPosition(asset) {
     const currency = toCurrencyCode(asset);
-    const data = await this._request("GET", "/api/v3/brokerage/accounts");
-    const accounts = data?.accounts ?? [];
+    const accounts = await this.listAccounts();
     const account = accounts.find(a => a.currency === currency);
     if (!account) return null;
     const available = parseFloat(account.available_balance?.value ?? "0");
