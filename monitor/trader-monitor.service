@@ -1,0 +1,10 @@
+[Unit]
+Description=Trader position watchdog (read-only, Telegram alerts)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/trader-monitor
+EnvironmentFile=%h/trader-monitor/monitor.env
+ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/trader-monitor/watchdog.mjs
+TimeoutStartSec=90

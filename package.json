@@ -1,7 +1,7 @@
 {
   "name": "@toknwrks/trader",
   "version": "0.1.0",
-  "description": "Autonomous trading agent for AgentSignal strategies. Runs locally — your keys never leave your machine.",
+  "description": "Autonomous trading agent for AgentSignal strategies. Runs locally \u2014 your keys never leave your machine.",
   "type": "module",
   "private": true,
   "scripts": {
@@ -10,9 +10,14 @@
     "stop": "pm2 stop all",
     "dashboard": "node dashboard.mjs",
     "trade": "node trader.mjs",
+    "test": "node --test test/*.test.mjs",
     "logs": "pm2 logs trader",
     "restart": "pm2 restart trader-dashboard",
-    "schwab-auth": "node schwab-auth.mjs"
+    "schwab-auth": "node schwab-auth.mjs",
+    "app:stage": "node scripts/stage-app.mjs",
+    "app:dev": "node scripts/stage-app.mjs && electron .app-stage",
+    "app:dev:dry": "node scripts/stage-app.mjs && TRADER_DRY_RUN=1 electron .app-stage",
+    "app:build": "node scripts/stage-app.mjs && electron-builder --projectDir .app-stage --config electron-builder.json --mac dir --arm64"
   },
   "dependencies": {
     "@nktkas/hyperliquid": "^0.32.2",
@@ -24,5 +29,12 @@
     "marked": "^17.0.5",
     "viem": "^2.47.10"
   },
-  "packageManager": "pnpm@9.13.2+sha512.88c9c3864450350e65a33587ab801acf946d7c814ed1134da4a924f6df5a2120fd36b46aab68f7cd1d413149112d53c7db3a4136624cfd00ff1846a0c6cef48a"
+  "packageManager": "pnpm@9.13.2+sha512.88c9c3864450350e65a33587ab801acf946d7c814ed1134da4a924f6df5a2120fd36b46aab68f7cd1d413149112d53c7db3a4136624cfd00ff1846a0c6cef48a",
+  "devDependencies": {
+    "electron": "^45.3.0",
+    "electron-builder": "^26.18.0"
+  },
+  "appDependencyOverrides": {
+    "better-sqlite3": "13.0.3"
+  }
 }

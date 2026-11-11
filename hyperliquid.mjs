@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { createWalletClient, http } from "viem";
 import { mainnet } from "viem/chains";
 import { ExchangeClient, InfoClient, HttpTransport } from "@nktkas/hyperliquid";
+import { formatPrice } from "@nktkas/hyperliquid/utils";
 
 const transport = new HttpTransport();
 
@@ -51,6 +52,22 @@ function getSzDecimals(asset) {
 function fmtSize(size, asset) {
   const dec = getSzDecimals(asset);
   return new Decimal(String(size)).toDecimalPlaces(dec).toFixed(dec);
+}
+
+/**
+ * Format a price the way Hyperliquid accepts it: at most 5 significant figures
+ * and at most (6 − szDecimals) decimals for perps, (8 − szDecimals) for spot.
+ * A price outside these rules is rejected ("Invalid TP/SL price" for triggers).
+ * Pure — no network. Truncates, never rounds.
+ */
+export function formatHlPrice(px, szDecimals, type = "perp") {
+  return formatPrice(new Decimal(String(px)).toFixed(), szDecimals, type);
+}
+
+// Same, looking the asset's decimals up in the meta caches. Callers must have
+// awaited _loadCaches() (getAssetIndex and getMidPrice both do).
+function fmtPrice(px, asset) {
+  return formatHlPrice(px, getSzDecimals(asset), isSpotAsset(asset) ? "spot" : "perp");
 }
 
 async function getAssetIndex(asset) {
@@ -139,11 +156,9 @@ export async function placeMarketOrder(privateKey, asset, side, size, slippage =
   const mid = await getMidPrice(asset);
   if (!mid) throw new Error(`Could not get mid price for ${asset}`);
 
-  const limitPx = isBuy
-    ? (mid * (1 + slippage)).toPrecision(5)
-    : (mid * (1 - slippage)).toPrecision(5);
-
   const assetIdx = await getAssetIndex(asset);
+
+  const limitPx = fmtPrice(isBuy ? mid * (1 + slippage) : mid * (1 - slippage), asset);
 
   console.log(`[hyperliquid] Placing ${side.toUpperCase()} ${size} ${asset} @ ~$${mid.toLocaleString()} (limit $${parseFloat(limitPx).toLocaleString()})`);
 
@@ -190,7 +205,7 @@ export async function placeLimitOrder(privateKey, asset, side, size, limitPrice)
     orders: [{
       a: assetIdx,
       b: isBuy,
-      p: limitPrice.toPrecision(6),
+      p: fmtPrice(limitPrice, asset),
       s: fmtSize(size, asset),
       r: false,
       t: { limit: { tif: "Gtc" } },
@@ -216,6 +231,24 @@ export async function getOpenOrders(address) {
 }
 
 /**
+ * Resting reduce-only trigger orders (stops / take-profits) for one asset.
+ * Returns [{ id, asset, side, size, triggerPrice }].
+ */
+export async function getStopOrders(address, asset) {
+  const info = new InfoClient({ transport });
+  const orders = await info.frontendOpenOrders({ user: address });
+  return (orders ?? [])
+    .filter(o => o.isTrigger && o.reduceOnly && o.coin?.toUpperCase() === asset.toUpperCase())
+    .map(o => ({
+      id: o.oid,
+      asset: o.coin,
+      side: o.side === "B" ? "buy" : "sell",
+      size: parseFloat(o.sz),
+      triggerPrice: parseFloat(o.triggerPx),
+    }));
+}
+
+/**
  * Place a native stop-loss order (trigger market, reduce-only).
  * Returns { result, oid } — oid is null if the exchange didn't echo it.
  */
@@ -223,10 +256,9 @@ export async function placeStopOrder(signer, asset, isLong, size, triggerPrice) 
   const { exchange } = makeClients(signer);
   const assetIdx = await getAssetIndex(asset);
   // Limit px is worst acceptable fill — 5% slippage beyond trigger guarantees market fill
-  const limitPx = isLong
-    ? (triggerPrice * 0.95).toPrecision(5)
-    : (triggerPrice * 1.05).toPrecision(5);
-  console.log(`[hyperliquid] Native SL ${isLong ? "SELL" : "BUY"} ${size} ${asset} trigger $${triggerPrice.toLocaleString()} limit $${parseFloat(limitPx).toLocaleString()}`);
+  const limitPx   = fmtPrice(isLong ? triggerPrice * 0.95 : triggerPrice * 1.05, asset);
+  const triggerPx = fmtPrice(triggerPrice, asset);
+  console.log(`[hyperliquid] Native SL ${isLong ? "SELL" : "BUY"} ${size} ${asset} trigger $${triggerPx} limit $${limitPx}`);
   const result = await exchange.order({
     orders: [{
       a: assetIdx,
@@ -234,7 +266,7 @@ export async function placeStopOrder(signer, asset, isLong, size, triggerPrice) 
       p: limitPx,
       s: fmtSize(size, asset),
       r: true,
-      t: { trigger: { triggerPx: triggerPrice.toPrecision(6), isMarket: true, tpsl: "sl" } },
+      t: { trigger: { triggerPx, isMarket: true, tpsl: "sl" } },
     }],
     grouping: "na",
   });
@@ -318,7 +350,7 @@ export async function closePosition(privateKey, asset) {
   console.log(`[hyperliquid] Closing ${size} ${asset} position`);
 
   if (isSpotAsset(asset)) {
-    const limitPx = (mid * (1 - slippage)).toPrecision(5);
+    const limitPx = fmtPrice(mid * (1 - slippage), asset);
     return exchange.order({
       orders: [{
         a: assetIdx,
@@ -333,9 +365,7 @@ export async function closePosition(privateKey, asset) {
   }
 
   const isLong = parseFloat(pos.szi) > 0;
-  const limitPx = isLong
-    ? (mid * (1 - slippage)).toPrecision(5)
-    : (mid * (1 + slippage)).toPrecision(5);
+  const limitPx = fmtPrice(isLong ? mid * (1 - slippage) : mid * (1 + slippage), asset);
 
   return exchange.order({
     orders: [{

@@ -9,19 +9,12 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { APP_DIR, ENV_PATH, loadEnv } from "./paths.mjs";
+
+// Code and static files live in APP_DIR; .env and data/ live in TRADER_HOME.
+const __dirname = APP_DIR;
 const PORT = parseInt(process.env.DASHBOARD_PORT ?? "4100");
 
-// Load .env
-function loadEnv() {
-  try {
-    const lines = readFileSync(resolve(__dirname, ".env"), "utf8").split("\n");
-    for (const line of lines) {
-      const m = line.match(/^([^#=\s][^=]*)=(.*)$/);
-      if (m) process.env[m[1].trim()] = m[2].trim().replace(/^["']|["']$/g, "").replace(/\s*#.*$/, "");
-    }
-  } catch {}
-}
 loadEnv();
 
 // Live binding (not a startup snapshot): reassigned whenever the trading wallet
@@ -98,6 +91,7 @@ import {
   getTradingWallet, clearTradingWallet,
   listStakingContracts, insertStakingContract, deleteStakingContract,
   getVaultWatchlist, addVaultToken, removeVaultToken,
+  getOpenAlerts, resolveAlertById, resolveAlert, clearTpState, setStrategyAdaptiveSl,
 } from "./db.mjs";
 
 if (PRIVATE_KEY) maybeCreateDefaultWallet(PRIVATE_KEY);
@@ -440,6 +434,53 @@ input:focus, select:focus { border-color: rgba(168,241,247,0.4); }
 #toast.toast-err { border-color:rgba(248,113,113,0.35); color:#f87171; }
 `;
 
+function escHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+// Open alerts (position without a stop, failed run, …) shown on every page.
+function alertBanner() {
+  let alerts = [];
+  try { alerts = getOpenAlerts(); } catch {}
+  if (!alerts.length) return "";
+  const analystOn = process.env.CLAUDE_ANALYST === "true";
+  const rows = alerts.map(a => {
+    const critical = a.level === "critical";
+    const color = critical ? "#f87171" : "#fbbf24";
+    const note = a.analysis
+      ? `<div style="margin-top:0.5rem;padding:0.55rem 0.7rem;border-left:2px solid #A8F1F7;background:rgba(168,241,247,0.05);border-radius:0 6px 6px 0;font-size:0.8rem;line-height:1.5;color:rgba(255,255,255,0.8);white-space:pre-wrap"><span style="font-size:0.68rem;letter-spacing:0.04em;text-transform:uppercase;color:#A8F1F7">Claude's read</span>\n${escHtml(a.analysis)}</div>`
+      : "";
+    const explainBtn = analystOn && !a.analysis
+      ? `<button onclick="explainAlert(this, ${Number(a.id)})" style="font-size:0.72rem;padding:0.2rem 0.6rem;border-radius:6px;border:1px solid rgba(168,241,247,0.35);background:none;color:#A8F1F7;cursor:pointer;white-space:nowrap">Explain</button>`
+      : "";
+    return `<div style="display:flex;gap:0.75rem;align-items:flex-start;padding:0.6rem 0.9rem;border:1px solid ${color}55;background:${color}14;border-radius:8px;margin-bottom:0.4rem">
+      <span style="color:${color};font-weight:600;white-space:nowrap">${critical ? "⚠ Action needed" : "Notice"}</span>
+      <span style="flex:1;font-size:0.85rem;color:rgba(255,255,255,0.85)">${escHtml(a.message)}<br><span style="font-size:0.72rem;color:rgba(255,255,255,0.4)">${escHtml(a.created_at)} UTC</span>${note}</span>
+      ${explainBtn}
+      <button onclick="fetch('/api/alerts/dismiss',{method:'POST',body:JSON.stringify({id:${Number(a.id)}})}).then(()=>location.reload())" style="font-size:0.72rem;padding:0.2rem 0.6rem;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:none;color:rgba(255,255,255,0.6);cursor:pointer">Dismiss</button>
+    </div>`;
+  }).join("");
+  const script = analystOn ? `<script>
+    async function explainAlert(btn, id) {
+      btn.disabled = true; btn.textContent = 'Asking Claude…';
+      try {
+        const r = await fetch('/api/alerts/explain', { method: 'POST', body: JSON.stringify({ id }) });
+        const d = await r.json();
+        if (d.ok) { location.reload(); return; }
+        btn.textContent = 'Failed'; btn.title = d.error || '';
+        alertExplainError(btn, d.error);
+      } catch (e) { btn.textContent = 'Failed'; btn.title = e.message; }
+    }
+    function alertExplainError(btn, msg) {
+      const el = document.createElement('div');
+      el.style.cssText = 'font-size:0.72rem;color:#f87171;margin-top:0.3rem';
+      el.textContent = msg || 'Could not get an explanation';
+      btn.parentElement.querySelector('span[style*="flex:1"]').appendChild(el);
+    }
+  </script>` : "";
+  return `<div class="container" style="padding-bottom:0;margin-bottom:-0.5rem">${rows}</div>${script}`;
+}
+
 function shell(title, body, active = "") {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -519,6 +560,7 @@ function shell(title, body, active = "") {
   checkTraderStatus();
   setInterval(checkTraderStatus, 30000);
   </script>
+  ${alertBanner()}
   <div class="container">${body}</div>
 
   <!-- Activate/Deactivate modal -->
@@ -916,7 +958,6 @@ function shell(title, body, active = "") {
 
 // ── Env helpers ───────────────────────────────────────────────────────────────
 
-const ENV_PATH = resolve(__dirname, ".env");
 
 function readEnv() {
   try { return readFileSync(ENV_PATH, "utf8"); } catch { return ""; }
@@ -1978,7 +2019,7 @@ async function strategiesPage() {
         const lastTrades = getTradeHistory(s.id, 1);
         const lastAction = lastTrades[0]?.action ?? null;
         const posOpen = lastAction && (lastAction.startsWith("ENTERED") || lastAction.startsWith("SHORTED"));
-        const posLong = posOpen && lastAction.startsWith("ENTERED");
+        const posLong = posOpen && lastAction.startsWith("ENTERED") && !lastAction.startsWith("ENTERED SHORT");
         // scalpers enter whenever signal is directional + no position (no flip required)
         const willEnter = flipped || isScalper;
         let nextBadge = "";
@@ -2676,6 +2717,7 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
     { key: "alpaca",       icon: "🦙",  label: "Alpaca" },
     { key: "alchemy",      icon: "🔮",  label: "Alchemy" },
     { key: "payments",     icon: "💳",  label: "Payments" },
+    { key: "claude",       icon: "✳️",  label: "Claude Code" },
   ];
 
   // Schwab section content
@@ -2782,7 +2824,40 @@ async function settingsPage(saved = false, error = "", schwabAuthorized = false)
       </div>
     </div>` : "";
 
+  const { analystStatus } = await import("./analyst.mjs");
+  const ai = analystStatus();
+  const claudePane = `
+      <div style="font-size:0.8rem;line-height:1.55;color:rgba(255,255,255,0.6)">
+        Let the Claude Code installed on this Mac explain alerts in plain language: what is happening, how serious it is, and your options.
+        It runs under <b>your own Claude sign-in</b> — no API key, nothing shared with anyone else, and nothing extra to pay beyond your plan.
+        It is given the alert and your position figures only, with every tool switched off: it cannot read files, run commands or trade.
+      </div>
+      <div style="font-size:0.78rem;padding:0.55rem 0.75rem;border-radius:8px;border:1px solid ${ai.claude.found ? "rgba(74,222,128,0.3)" : "rgba(248,113,113,0.3)"};color:${ai.claude.found ? "#4ade80" : "#f87171"}">
+        ${ai.claude.found
+          ? `Claude Code found — ${escHtml(ai.claude.version ?? "version unknown")}<br><span style="color:rgba(255,255,255,0.35)">${escHtml(ai.claude.path)}</span>`
+          : `Claude Code was not found on this Mac. Install it and sign in (run <code>claude</code> once in Terminal), then reload this page.`}
+      </div>
+      <label style="display:flex;align-items:center;gap:0.6rem;font-size:0.85rem;color:#fafafa;cursor:pointer">
+        <input type="hidden" name="CLAUDE_ANALYST_PRESENT" value="1" />
+        <input type="checkbox" name="CLAUDE_ANALYST" value="true" ${ai.enabled ? "checked" : ""} ${ai.claude.found ? "" : "disabled"} />
+        Use my Claude Code to explain alerts
+      </label>
+      <div>
+        <label style="font-size:0.75rem;color:rgba(255,255,255,0.4);display:block;margin-bottom:0.3rem">Model</label>
+        <select name="CLAUDE_ANALYST_MODEL" style="width:100%">
+          ${[["haiku", "Haiku — fastest, lightest on your plan"], ["sonnet", "Sonnet — balanced (default)"], ["opus", "Opus — most thorough, uses more of your plan"]]
+            .map(([v, l]) => `<option value="${v}" ${ai.model === v ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+      </div>
+      ${field("Most explanations per day", "CLAUDE_ANALYST_DAILY_CAP", String(ai.dailyCap), "number",
+        `Protects your plan's usage. Used today: ${ai.usedToday} of ${ai.dailyCap}. The same problem on the same strategy is explained once per 6 hours.`)}
+      <div style="font-size:0.72rem;color:rgba(255,255,255,0.35)">
+        Critical alerts (a position with no stop-loss) are explained automatically in the desktop app. Any other alert has an <b>Explain</b> button in the banner.
+      </div>
+  `;
+
   const panes = {
+    claude: claudePane,
     general: `
       ${field("Default Margin to Risk (USD)", "HL_POSITION_SIZE_USD", val("HL_POSITION_SIZE_USD") || "10", "text", "Margin per trade — notional = margin × leverage. Used when a strategy has no size override.")}
     `,
@@ -3193,179 +3268,6 @@ function addStrategyPage(error = "") {
   `, "strategies");
 }
 
-// ── Local price-threshold evaluation (no x402) ───────────────────────────────
-
-function computeRSIDash(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d > 0) gains += d; else losses -= d;
-  }
-  let avgGain = gains / period, avgLoss = losses / period;
-  for (let i = period + 1; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
-    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
-  }
-  if (avgLoss === 0) return 100;
-  return 100 - 100 / (1 + avgGain / avgLoss);
-}
-function computeSMADash(values, period) {
-  if (values.length < period) return null;
-  return values.slice(-period).reduce((a, b) => a + b, 0) / period;
-}
-function computeEMADash(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
-  return ema;
-}
-
-async function tryLocalEvalDash(strategy) {
-  try {
-    const res = await fetch(`${getSignalUrl()}/api/strategy/${strategy.id}`);
-    if (!res.ok) return null;
-    const def = await res.json();
-    const parseJ = v => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return v; } };
-    const hasConditions = r => r?.conditions?.length > 0;
-    const entry      = hasConditions(parseJ(def.long_entry))  ? parseJ(def.long_entry)  : parseJ(def.entry);
-    const exit       = hasConditions(parseJ(def.long_exit))   ? parseJ(def.long_exit)   : parseJ(def.exit);
-    const shortEntry = hasConditions(parseJ(def.short_entry)) ? parseJ(def.short_entry) : null;
-    const shortExit  = hasConditions(parseJ(def.short_exit))  ? parseJ(def.short_exit)  : null;
-
-    const allConds = [
-      ...(entry?.conditions ?? []), ...(exit?.conditions ?? []),
-      ...(shortEntry?.conditions ?? []), ...(shortExit?.conditions ?? []),
-    ];
-    if (!allConds.length) return null;
-
-    const priceFlds      = new Set(["close", "price", "last", "mark", "open", "high", "low"]);
-    const indicatorFlds  = new Set(["rsi", "sma", "ema"]);
-    const passthroughFlds = new Set(["pct_above_entry", "pct_below_entry"]);
-    const knownFlds      = new Set([...priceFlds, ...indicatorFlds, ...passthroughFlds]);
-    if (!allConds.every(c => knownFlds.has((c.field ?? "close").toLowerCase()))) return null;
-
-    const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
-    const { KrakenExchange }      = await import("./exchanges/kraken.mjs");
-    const { AlpacaExchange }      = await import("./exchanges/alpaca.mjs");
-    const exch = strategy.exchange === "kraken"
-      ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
-      : strategy.exchange === "alpaca"
-      ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
-      : new HyperliquidExchange(PRIVATE_KEY);
-
-    const asset = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
-    const needsCandles = allConds.some(c => indicatorFlds.has((c.field ?? "close").toLowerCase()));
-
-    const [price, position] = await Promise.all([
-      exch.getMidPrice(asset),
-      exch.getPosition(asset).catch(() => null),
-    ]);
-    if (!price) return null;
-    const hasPosition = parseFloat(position?.szi ?? "0") !== 0;
-
-    // Compute indicators from candles if needed
-    const indicatorValues = {};
-    if (needsCandles && typeof exch.getCandles === "function") {
-      const MINS_TO_IV = { 1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",480:"8h",720:"12h",1440:"1d" };
-      // navigator (source=price) → daily candles; scalper (source=trigger) → condition interval
-      const defaultInterval = allConds.some(c => c.source === "trigger")
-        ? (MINS_TO_IV[strategy.interval_minutes ?? 60] ?? "1h")
-        : "1d";
-      const intervals = new Set(allConds.map(c => c.interval ?? defaultInterval));
-      const candlesByInterval = {};
-      for (const iv of intervals) {
-        const candles = await exch.getCandles(asset, iv, 100);
-        candlesByInterval[iv] = candles.map(c => parseFloat(c.c));
-      }
-      for (const c of allConds) {
-        const field  = (c.field ?? "close").toLowerCase();
-        if (!indicatorFlds.has(field)) continue;
-        const iv     = c.interval ?? defaultInterval;
-        const period = parseInt(c.period ?? 14);
-        const key    = `${field}_${period}_${iv}`;
-        if (indicatorValues[key] !== undefined) continue;
-        const closes = candlesByInterval[iv];
-        if (!closes?.length) continue;
-        switch (field) {
-          case "rsi": indicatorValues[key] = computeRSIDash(closes, period); break;
-          case "sma": indicatorValues[key] = computeSMADash(closes, period); break;
-          case "ema": indicatorValues[key] = computeEMADash(closes, period); break;
-        }
-      }
-    }
-
-    const defaultInterval = allConds.some(c => c.source === "trigger")
-      ? ({ 1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",480:"8h",720:"12h",1440:"1d" }[strategy.interval_minutes ?? 60] ?? "1h")
-      : "1d";
-
-    const evalRules = (rules) => {
-      if (!rules?.conditions?.length) return false;
-      const results = rules.conditions.map(c => {
-        const field = (c.field ?? "close").toLowerCase();
-        const v     = parseFloat(c.value);
-        let actual;
-        if (indicatorFlds.has(field)) {
-          const period = parseInt(c.period ?? 14);
-          const iv     = c.interval ?? defaultInterval;
-          actual = indicatorValues[`${field}_${period}_${iv}`];
-        } else {
-          actual = price;
-        }
-        if (actual == null) return false;
-        const op = c.op;
-        if (op === "<="  || op === "lte") return actual <= v;
-        if (op === ">="  || op === "gte") return actual >= v;
-        if (op === "<"   || op === "lt")  return actual <  v;
-        if (op === ">"   || op === "gt")  return actual >  v;
-        return false;
-      });
-      return rules.operator === "AND" ? results.every(Boolean) : results.some(Boolean);
-    };
-
-    // Funding gate (fail-closed)
-    const risk = parseJ(def.risk) ?? {};
-    let fundingRate = null;
-    if (risk.funding_long_gate != null || risk.funding_short_gate != null) {
-      try {
-        const fRes = await fetch("https://api.hyperliquid.xyz/info", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-        });
-        const [meta, ctxs] = await fRes.json();
-        const idx = meta.universe.findIndex(a => a.name === asset);
-        if (idx !== -1) fundingRate = parseFloat(ctxs[idx].funding);
-      } catch { /* fail closed */ }
-    }
-    const longGateOk  = risk.funding_long_gate  == null || (fundingRate !== null && fundingRate <= risk.funding_long_gate);
-    const shortGateOk = risk.funding_short_gate == null || (fundingRate !== null && fundingRate >= risk.funding_short_gate);
-
-    let signal;
-    if (shortEntry) {
-      if (hasPosition) {
-        const isLong = parseFloat(position?.szi ?? "0") > 0;
-        signal = isLong
-          ? (evalRules(exit)      ? "FLAT" : "LONG")
-          : (evalRules(shortExit) ? "FLAT" : "SHORT");
-      } else {
-        if      (evalRules(entry)      && longGateOk)  signal = "LONG";
-        else if (evalRules(shortEntry) && shortGateOk) signal = "SHORT";
-        else                                            signal = "FLAT";
-      }
-    } else {
-      signal = hasPosition
-        ? (evalRules(exit)  ? "FLAT" : "LONG")
-        : (evalRules(entry) ? "LONG" : "FLAT");
-    }
-
-    return { signal, price };
-  } catch {
-    return null;
-  }
-}
-
 // ── API handlers ──────────────────────────────────────────────────────────────
 
 async function handleClose(body) {
@@ -3394,18 +3296,25 @@ async function handleClose(body) {
     return { ok: true, asset, result };
   }
 
-  if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
-  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
-  const exch = new HyperliquidExchange(PRIVATE_KEY);
+  // Same signer as the trading engine (vault or trading wallet)
+  const { cancelNativeStop } = await import("./execution.mjs");
+  const exch = await tradingHlExchange();
   const position = await exch.getPosition(asset).catch(() => null);
   const midPrice = await exch.getMidPrice(asset).catch(() => 0);
+  // Cancel the strategy's native stop first so it is not left resting
+  if (strategy) await cancelNativeStop(strategy, exch, asset);
   const result = await exch.closePosition(asset);
+  if (strategy) {
+    clearTpState(strategy.id);
+    setStrategyAdaptiveSl(strategy.id, null);
+    resolveAlert(strategy.id, "stop_missing");
+    resolveAlert(strategy.id, "stop_breached");
+  }
   if (strategy && position) {
     const size = Math.abs(parseFloat(position?.szi ?? "0"));
     const entryPx = parseFloat(position?.entryPx ?? "0");
     const dir = parseFloat(position?.szi ?? "0") >= 0 ? 1 : -1;
     const pnl = size && entryPx ? parseFloat(((midPrice - entryPx) * size * dir).toFixed(2)) : null;
-    const { insertTrade } = await import("./db.mjs");
     insertTrade({ strategy_id: strategy.id, action: `CLOSED ${asset} @ ~$${midPrice.toLocaleString()} [manual]`, asset, size, price: midPrice, leverage: strategy.leverage ?? 1, pnl });
   }
   return { ok: true, asset, result };
@@ -3635,8 +3544,11 @@ async function handleSubscribeStrategy(body) {
   return await paid.json();
 }
 
+// Both routes go through execution.mjs — the same code the scheduled runner
+// uses — so a manual run gets the same guards, stop-loss and trade records.
+
+// Act on the latest stored signal without fetching a new one.
 async function handleExecute(body) {
-  if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
   const { id } = JSON.parse(body);
   const strategy = getStrategy(id);
   if (!strategy) return { ok: false, error: "Strategy not found" };
@@ -3644,182 +3556,33 @@ async function handleExecute(body) {
   const latest = getLatestSignal(id);
   if (!latest) return { ok: false, error: "No signal available. Run the trader first." };
 
-  const { placeMarketOrder, closePosition, getPosition, getMidPrice, setLeverage } = await import("./hyperliquid.mjs");
-  const { privateKeyToAccount } = await import("viem/accounts");
-  const account = privateKeyToAccount(PRIVATE_KEY);
-
-  const hlAsset = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
-  const leverage = strategy.leverage ?? 1;
-  const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
-  const midPrice = await getMidPrice(hlAsset);
-  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
-  const position = await getPosition(account.address, hlAsset);
-  const currentSize = parseFloat(position?.szi ?? "0");
-  const isFlat = currentSize === 0;
-  const isLong = currentSize > 0;
-  const signal = latest.signal;
-
-  let action = "HOLD";
-  let result = null;
-
-  if (signal === "LONG" && isFlat) {
-    await setLeverage(PRIVATE_KEY, hlAsset, leverage);
-    result = await placeMarketOrder(PRIVATE_KEY, hlAsset, "buy", positionSize);
-    action = `ENTERED LONG ${positionSize} ${hlAsset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
-  } else if ((signal === "FLAT" || signal === "SHORT") && !isFlat) {
-    result = await closePosition(PRIVATE_KEY, hlAsset);
-    action = `CLOSED ${Math.abs(currentSize)} ${hlAsset}`;
-    if (signal === "SHORT") {
-      await setLeverage(PRIVATE_KEY, hlAsset, leverage);
-      result = await placeMarketOrder(PRIVATE_KEY, hlAsset, "sell", positionSize);
-      action = `SHORTED ${positionSize} ${hlAsset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
-    }
-  } else {
-    action = `HOLD — signal ${signal}, position ${currentSize}`;
-  }
-
+  const { executeTrade } = await import("./execution.mjs");
+  const action = await executeTrade(
+    { ...strategy, sl_pct: strategy.sl_pct_adaptive ?? strategy.sl_pct },
+    latest.signal,
+    latest,
+  );
   return { ok: true, action };
 }
 
+// Fetch a fresh signal and act on it.
 async function handleRun(body) {
-  if (!PRIVATE_KEY) return { ok: false, error: "AGENT_PRIVATE_KEY not set" };
   const { id } = JSON.parse(body);
   const strategy = getStrategy(id);
   if (!strategy) return { ok: false, error: "Strategy not found" };
 
-  // Fetch strategy def once — used for scalper detection and URL routing
-  const stratDef = await fetch(`${getSignalUrl()}/api/strategy/${id}`).then(r => r.ok ? r.json() : null).catch(() => null);
-  const stratRisk = (() => { try { return typeof stratDef?.risk === "string" ? JSON.parse(stratDef.risk) : (stratDef?.risk ?? {}); } catch { return {}; } })();
-  const isScalperRun = stratRisk?.mode === "scalp";
+  const { runStrategyOnce } = await import("./execution.mjs");
+  const r = await runStrategyOnce(strategy);
+  if (r.fetchFailed) return { ok: false, error: "Could not fetch signal from AgentSignal" };
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, action: r.action };
+}
 
-  // Try local price evaluation first (free, no x402 cost)
-  let signalData = await tryLocalEvalDash(strategy);
-
-  if (!signalData) {
-    // Fall back to x402 fetch
-    const { x402Client } = await import("@x402/core/client");
-    const { decodePaymentRequiredHeader, encodePaymentSignatureHeader } = await import("@x402/core/http");
-    const { ExactEvmScheme } = await import("@x402/evm/exact/client");
-    const { http } = await import("viem");
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const allChains = await import("viem/chains");
-
-    const account = privateKeyToAccount(PRIVATE_KEY);
-    const client = new x402Client();
-
-    const isScalperStrategy = isScalperRun;
-    const url = isScalperStrategy
-      ? `${getSignalUrl()}/api/scalper/${id}/signal`
-      : `${getSignalUrl()}/api/strategy/${id}/signal`;
-    try {
-      const probe = await fetch(url);
-      console.log(`[run-strategy] probe status: ${probe.status}`);
-      if (probe.ok) {
-        signalData = await probe.json();
-      } else if (probe.status === 402) {
-        const rawHeader = probe.headers.get("payment-required") ?? probe.headers.get("X-PAYMENT-REQUIRED");
-        if (!rawHeader) throw new Error("No payment-required header in 402 response");
-        const paymentRequired = decodePaymentRequiredHeader(rawHeader);
-
-        const serverNetwork = paymentRequired.accepts?.[0]?.network ?? paymentRequired.accepts?.network;
-        const networkCfg = X402_NETWORKS[serverNetwork] ?? X402_NETWORKS[getPaymentNetwork()] ?? X402_NETWORKS["eip155:8453"];
-        const chain = allChains[networkCfg.viemChain];
-        const walletClient = (await import("viem")).createWalletClient({ account, chain, transport: http(networkCfg.rpc) });
-        const signer = Object.assign(walletClient, { address: account.address });
-        client.register(serverNetwork, new ExactEvmScheme(signer));
-
-        console.log(`[run-strategy] 💳 Paying on ${networkCfg.label ?? serverNetwork}`);
-        const paymentPayload = await client.createPaymentPayload(paymentRequired);
-        const paymentHeader = encodePaymentSignatureHeader(paymentPayload);
-        const paid = await fetch(url, { headers: { "payment-signature": paymentHeader } });
-        console.log(`[run-strategy] paid status: ${paid.status}`);
-        if (paid.ok) {
-          signalData = await paid.json();
-        } else {
-          const errBody = await paid.text().catch(() => "");
-          throw new Error(`Payment rejected (${paid.status}): ${errBody.slice(0, 200)}`);
-        }
-      } else {
-        throw new Error(`Unexpected probe status: ${probe.status}`);
-      }
-    } catch (err) {
-      console.error(`[run-strategy] signal fetch error:`, err.message);
-      return { ok: false, error: `Could not fetch signal: ${err.message}` };
-    }
-    if (!signalData) return { ok: false, error: "Could not fetch signal from AgentSignal" };
-  }
-
-  const signal = signalData.signal;
-  const price  = signalData.price ?? null;
-  const priorSignal = getLatestSignal(id);
-
-  // Build notes from scores (same logic as trader.mjs)
-  const c = signalData.compass;
-  const scoreNotes = [
-    c?.score            != null ? `COMPASS:${c.score}` : null,
-    c?.radar_score      != null ? `RADAR:${c.radar_score}` : null,
-    c?.crypto_radar_score != null ? `CRYPTO:${c.crypto_radar_score}` : null,
-  ].filter(Boolean).join(" | ");
-
-  // Save signal
-  const { upsertSignal } = await import("./db.mjs");
-  upsertSignal({ strategy_id: id, signal, price, date: signalData.date ?? new Date().toISOString().slice(0,10), notes: scoreNotes || null });
-
-  // Scalpers act whenever signal is directional + no open position (no flip required)
-  const prev = priorSignal?.signal ?? null;
-  const isFlip = signal !== prev;
-  const shouldAct = isScalperRun
-    ? (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null))
-    : isFlip && (signal === "LONG" || signal === "SHORT" || (signal === "FLAT" && prev !== null));
-  if (!shouldAct) return { ok: true, action: `Signal is ${signal} (no change from ${prev ?? "none"}) — no trade executed` };
-
-  // Execute trade via exchange abstraction
-  const { HyperliquidExchange } = await import("./exchanges/hyperliquid.mjs");
-  const { KrakenExchange } = await import("./exchanges/kraken.mjs");
-  const { AlpacaExchange } = await import("./exchanges/alpaca.mjs");
-  const exch = strategy.exchange === "kraken"
-    ? new KrakenExchange(process.env.KRAKEN_API_KEY, process.env.KRAKEN_API_SECRET)
-    : strategy.exchange === "alpaca"
-    ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
-    : new HyperliquidExchange(PRIVATE_KEY);
-
-  const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
-  const leverage = strategy.leverage ?? 1;
-  const sizeUsd  = strategy.position_size_usd ?? parseFloat(process.env.HL_POSITION_SIZE_USD ?? "10");
-  const midPrice = await exch.getMidPrice(asset);
-  const positionSize = parseFloat(((sizeUsd * leverage) / midPrice).toFixed(5));
-  const position = await exch.getPosition(asset);
-  const currentSize  = parseFloat(position?.szi ?? "0");
-  const entryPrice   = parseFloat(position?.entryPx ?? "0");
-  const isLong       = currentSize > 0;
-  const isFlat       = currentSize === 0;
-
-  let action = "HOLD";
-  let pnl    = null;
-  if (signal === "LONG" && isFlat) {
-    await exch.setLeverage(asset, leverage);
-    await exch.placeMarketOrder(asset, "buy", positionSize);
-    action = `ENTERED LONG ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
-  } else if (signal === "FLAT" && !isFlat) {
-    if (entryPrice > 0) {
-      const dir = isLong ? 1 : -1;
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize) * dir).toFixed(2));
-    }
-    await exch.closePosition(asset);
-    action = `CLOSED ${Math.abs(currentSize)} ${asset} @ ~$${midPrice.toLocaleString()}`;
-  } else if (signal === "SHORT" && !isFlat) {
-    if (entryPrice > 0 && isLong) {
-      pnl = parseFloat(((midPrice - entryPrice) * Math.abs(currentSize)).toFixed(2));
-    }
-    await exch.closePosition(asset);
-    await exch.setLeverage(asset, leverage);
-    await exch.placeMarketOrder(asset, "sell", positionSize);
-    action = `SHORTED ${positionSize} ${asset} @ ~$${midPrice.toLocaleString()} (${leverage}x)`;
-  }
-
-  const { insertTrade } = await import("./db.mjs");
-  insertTrade({ strategy_id: id, action, asset, size: positionSize, price: midPrice, leverage, pnl });
-  return { ok: true, action };
+// Hyperliquid client for manual actions — signs with the vault or the trading
+// wallet, exactly as the engine does.
+async function tradingHlExchange() {
+  const { getExchange } = await import("./execution.mjs");
+  return getExchange({ exchange: "hyperliquid" });
 }
 
 async function handleOpen(body) {
@@ -3839,7 +3602,7 @@ async function handleOpen(body) {
     ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
     : strategy.exchange === "coinbase"
     ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
-    : new HyperliquidExchange(PRIVATE_KEY);
+    : await tradingHlExchange();
 
   const asset    = strategy.symbol.replace(/-USD$/, "").replace(/\/USD$/, "");
   const leverage = strategy.leverage ?? 1;
@@ -3878,7 +3641,7 @@ async function handleAddToPosition(body) {
     ? new AlpacaExchange(process.env.ALPACA_API_KEY, process.env.ALPACA_API_SECRET, process.env.ALPACA_PAPER === "true")
     : exchange === "coinbase"
     ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
-    : new HyperliquidExchange(PRIVATE_KEY);
+    : await tradingHlExchange();
 
   const midPrice = await exch.getMidPrice(asset);
   const notional = sizeUsd * (leverage ?? 1);
@@ -3918,7 +3681,7 @@ async function getExchangeInstance(exchange) {
     ? new CoinbaseExchange(process.env.COINBASE_API_KEY, process.env.COINBASE_API_SECRET, process.env.COINBASE_API_PASSPHRASE)
     : exchange === "Schwab"
     ? new SchwabExchange(process.env.SCHWAB_API_KEY, process.env.SCHWAB_APP_SECRET)
-    : new HyperliquidExchange(PRIVATE_KEY);
+    : await tradingHlExchange();
 }
 
 
@@ -4486,6 +4249,11 @@ function renderUniswapPage() {
     <h1 style="font-size:1.5rem;font-weight:700;color:#fafafa;letter-spacing:-0.03em">Yield</h1>
     <p id="uniWalletLine" style="font-size:0.78rem;color:rgba(255,255,255,0.4);margin-top:0.25rem">V3 + V4 · Base</p>
   </div>
+  <a href="${getSignalUrl()}/lp-backtest" target="_blank" rel="noopener"
+    title="Test rotating a pool position into a long on a pullback, on past prices"
+    style="margin-left:auto;margin-right:0.6rem;padding:0.4rem 0.9rem;border-radius:6px;border:1px solid rgba(168,241,247,0.3);color:#A8F1F7;font-size:0.8rem;text-decoration:none">
+    Backtest an LP strategy ↗
+  </a>
   <button onclick="loadPositions()" id="uniRefreshBtn"
     style="display:flex;align-items:center;gap:0.4rem;padding:0.4rem 0.9rem;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:rgba(255,255,255,0.6);cursor:pointer;font-size:0.8rem;transition:all 0.15s"
     onmouseover="this.style.borderColor='rgba(255,255,255,0.25)';this.style.color='#fafafa'"
@@ -4551,6 +4319,11 @@ function uVersionBadge(v) {
   return v === 'v4' ? '<span class="uni-badge-v4">v4</span>' : '<span class="uni-badge-v3">v3</span>';
 }
 
+// A position is worth showing while it holds liquidity or has uncollected fees.
+// Closed positions (liquidity withdrawn, nothing owed) stay in the wallet as
+// empty NFTs forever — those are hidden.
+function uniHasValue(p) { return !!(p.hasLiquidity || p.hasFees); }
+
 async function loadPositions() {
   const btn = document.getElementById('uniRefreshBtn');
   const icon = document.getElementById('uniRefreshIcon');
@@ -4569,7 +4342,8 @@ async function loadPositions() {
 
     const v3Positions = (v3Res.status === 'fulfilled' && v3Res.value.positions) ? v3Res.value.positions : [];
     const v4Positions = (v4Res.status === 'fulfilled' && v4Res.value.positions) ? v4Res.value.positions : [];
-    const allPositions = [...v3Positions, ...v4Positions];
+    // Hide empty positions: no liquidity left and no fees to collect
+    const allPositions = [...v3Positions, ...v4Positions].filter(uniHasValue);
 
     _uniPositions.length = 0;
     allPositions.forEach(p => _uniPositions.push(p));
@@ -4910,7 +4684,7 @@ async function loadChainPositions(chain) {
     if (!addresses.length) { tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="5">No wallet configured.</td></tr>'; return; }
     const res = await fetch('/uniswap/' + chain + '/positions');
     const data = await res.json();
-    const positions = data.positions ?? [];
+    const positions = (data.positions ?? []).filter(uniHasValue);
     countEl.textContent = positions.length ? positions.length + ' position' + (positions.length > 1 ? 's' : '') : 'none';
     if (!positions.length) {
       tbody.innerHTML = '<tr class="uni-loading-row"><td colspan="5">No V3 positions on ' + (chain === 'arbitrum' ? 'Arbitrum' : 'Ethereum') + '.</td></tr>';
@@ -5109,13 +4883,14 @@ const server = createServer(async (req, res) => {
                           "COINBASE_API_KEY","COINBASE_API_SECRET","COINBASE_API_PASSPHRASE",
                           "X402_PAYMENT_NETWORK","ALCHEMY_API_KEY",
                           "SCHWAB_API_KEY","SCHWAB_APP_SECRET","SCHWAB_REDIRECT_URI",
-                          "AGENT_API_KEY"]) {
+                          "AGENT_API_KEY","CLAUDE_ANALYST_MODEL","CLAUDE_ANALYST_DAILY_CAP"]) {
         let v = params.get(key)?.trim();
         if (!v) continue;
         if (key === "COINBASE_API_SECRET" && v.includes("\n")) v = v.replace(/\r?\n/g, "\\n");
         updates[key] = v;
       }
       updates["ALPACA_PAPER"] = params.get("ALPACA_PAPER") === "true" ? "true" : "false";
+      if (params.get("CLAUDE_ANALYST_PRESENT")) updates["CLAUDE_ANALYST"] = params.get("CLAUDE_ANALYST") === "true" ? "true" : "false";
       try {
         writeEnvValues(updates);
         return send(await settingsPage(true));
@@ -5326,6 +5101,43 @@ const server = createServer(async (req, res) => {
     if (url === "/api/edit-order" && method === "POST") {
       const body = await readBody();
       return json(await handleEditOrder(body).catch(e => ({ ok: false, error: e.message })));
+    }
+
+    if (url === "/api/alerts" && method === "GET") {
+      return json({ alerts: getOpenAlerts() });
+    }
+
+    if (url === "/api/alerts/explain" && method === "POST") {
+      try {
+        const { id } = JSON.parse(await readBody());
+        const { analyzeAlert } = await import("./analyst.mjs");
+        return json({ ok: true, analysis: await analyzeAlert(Number(id)) });
+      } catch (e) {
+        return json({ ok: false, error: e.message });
+      }
+    }
+
+    if (url === "/api/analyst/status" && method === "GET") {
+      const { analystStatus } = await import("./analyst.mjs");
+      return json(analystStatus());
+    }
+
+    if (url === "/api/alerts/dismiss" && method === "POST") {
+      const { id } = JSON.parse(await readBody());
+      resolveAlertById(Number(id));
+      return json({ ok: true });
+    }
+
+    // Runner status. Inside the desktop app the built-in scheduler answers;
+    // otherwise PM2 is asked.
+    if (url === "/api/pm2-status" && method === "GET" && _scheduler) {
+      const st = _scheduler.status();
+      return json({ app: true, running: !st.paused, scheduled: false, ...st });
+    }
+
+    if (url === "/api/pm2-start" && method === "POST" && _scheduler) {
+      _scheduler.setPaused(false);
+      return json({ ok: true });
     }
 
     if (url === "/api/pm2-status" && method === "GET") {
@@ -5824,7 +5636,27 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`\n🤖 AgentSignal Trader Dashboard`);
-  console.log(`   http://localhost:${PORT}\n`);
-});
+// The dashboard has no login, and its routes can trade and move funds, so it
+// listens on this machine only — never on the network.
+const HOST = "127.0.0.1";
+
+let _scheduler = null;
+/** The desktop app hands over its scheduler so status/start routes use it. */
+export function attachScheduler(scheduler) { _scheduler = scheduler; }
+
+export function startServer({ port = PORT } = {}) {
+  return new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(port, HOST, () => {
+      console.log(`\n🤖 AgentSignal Trader Dashboard`);
+      console.log(`   http://localhost:${port}\n`);
+      resolveListen({ port, host: HOST });
+    });
+  });
+}
+
+// Run directly (`node dashboard.mjs`, PM2) → start listening. When imported by
+// the desktop app, the app calls startServer() itself.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startServer().catch(err => { console.error(`[dashboard] ${err.message}`); process.exit(1); });
+}

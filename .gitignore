@@ -7,3 +7,8 @@ pm2.log
 CLAUDE.md
 cheatsheet.md
 docs/
+.app-stage/
+dist/
+monitor/monitor.env
+monitor/state.json
+backtest/data/

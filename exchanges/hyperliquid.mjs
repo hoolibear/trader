@@ -12,6 +12,7 @@ import {
   closePosition as hlClose,
   setLeverage as hlSetLeverage,
   getOpenOrders as hlGetOpenOrders,
+  getStopOrders as hlGetStopOrders,
   cancelOrder as hlCancelOrder,
   getCandleSnapshots as hlGetCandles,
 } from "../hyperliquid.mjs";
@@ -57,13 +58,17 @@ export class HyperliquidExchange {
     return hlGetOpenOrders(this.address);
   }
 
+  async getStopOrders(asset) {
+    return hlGetStopOrders(this.address, asset);
+  }
+
   async cancelOrder(orderId, asset) {
-    return hlCancelOrder(this.signer, asset, orderId);
+    return hlCancelOrder(this.signer, asset, Number(orderId));
   }
 
   async editOrder(orderId, asset, side, size, limitPrice) {
     console.log(`[hyperliquid] Editing order ${orderId} (cancel + replace): ${size} ${asset} @ $${limitPrice}`);
-    await hlCancelOrder(this.signer, asset, orderId);
+    await hlCancelOrder(this.signer, asset, Number(orderId));
     return hlPlaceLimitOrder(this.signer, asset, side, size, limitPrice);
   }
 

@@ -8,7 +8,9 @@ Your private key never leaves your machine.
 
 - **Repo**: `github.com/ToknWrks/trader`
 - **AgentSignal app**: `/Users/lancepitman/AgentSignal/` (separate repo)
-- **Dashboard**: `http://localhost:4100` (run `npm run dashboard`)
+- **Dashboard**: `http://localhost:4100` (run `npm run dashboard`) — listens on 127.0.0.1 only
+- **Desktop app**: `npm run app:build` → `dist/mac-arm64/AgentSignal Trader.app` (spec: `docs/electron-app.md`)
+- **Bug log**: `docs/bugs-to-research.md` — engine bugs fixed 2026-11-10 and what is still open
 
 ## Roadmap
 
@@ -57,10 +59,13 @@ See `docs/vps-trader.md` for full architecture, open questions, and Engine compa
 ```bash
 npm run setup        # interactive setup wizard (first-time)
 npm run dashboard    # local control panel at localhost:4100
-npm run restart      # restart dashboard + PM2 processes
+npm run restart      # restart the PM2 dashboard process only (not the traders)
+npm test             # engine, scheduler and run-lock tests (fake exchange, no network)
+npm run app:dev      # desktop app from source (app:dev:dry = no orders)
+npm run app:build    # build the unsigned Mac app into dist/
 npm start            # start all PM2 processes
 npm run trade        # manual one-shot run (all strategies)
-node trader.mjs --dry-run          # simulate without executing
+node trader.mjs --dry-run          # simulate: no orders, nothing written (or TRADER_DRY_RUN=1)
 node trader.mjs --crypto-only      # only crypto strategies
 node trader.mjs --stocks-only      # only stock/ETF strategies
 ```
@@ -69,9 +74,18 @@ node trader.mjs --stocks-only      # only stock/ETF strategies
 
 | File | Purpose |
 |---|---|
-| `trader.mjs` | Main runner — fetch signal, detect flip, execute |
+| `trader.mjs` | CLI runner (PM2) — picks due strategies, calls the engine |
+| `execution.mjs` | **Trading engine** — signal fetch, entry gate, orders, native stop, TP/trail. The only place trade logic lives; CLI, dashboard and desktop app all call it |
+| `scheduler.mjs` | In-process scheduler used by the desktop app (replaces PM2 cron) |
+| `runlock.mjs` | `data/runner.lock` — one runner at a time (app vs CLI/PM2) |
+| `paths.mjs` | `TRADER_HOME` → `.env` and `data/` location (default: repo) |
+| `markets.mjs` | `isCrypto()` + crypto ticker list |
+| `analyst.mjs` | "Use my Claude Code": runs the user's local `claude -p` (their own sign-in, tools off, API key env stripped) to explain alerts. Off by default; `CLAUDE_ANALYST*` in `.env`, Settings → Claude Code tab. Advisory only — never trades |
+| `monitor/` | Read-only VPS watchdog with Telegram alerts (address only, no keys). Deployed on the worker VPS at `~/trader-monitor/` |
+| `electron/main.mjs` | Desktop app shell: tray, window, notifications |
+| `scripts/stage-app.mjs` | Builds `.app-stage/` for Electron. Never run `electron-rebuild` (it wipes the repo's SQLite binary) |
 | `dashboard.mjs` | Local web dashboard (HTTP server, no framework) |
-| `db.mjs` | SQLite via better-sqlite3: strategies, signals, trades |
+| `db.mjs` | SQLite via better-sqlite3: strategies, signals, trades, alerts |
 | `hyperliquid.mjs` | Hyperliquid client (`@nktkas/hyperliquid` + viem) |
 | `vultisig-vault.mjs` | VultiSig Fast Vault signing |
 | `setup.mjs` | Interactive setup wizard |
@@ -82,32 +96,45 @@ node trader.mjs --stocks-only      # only stock/ETF strategies
 | Process | Args | Cron | When |
 |---|---|---|---|
 | `trader` | `--stocks-only` | `31 13 * * 1-5` | 9:31 AM ET, weekdays |
-| `trader-crypto` | `--crypto-only` | `0 * * * *` | top of every hour, 24/7 |
+| `trader-crypto` | `--crypto-only` | `*/5 * * * *` | every 5 min, 24/7 — each strategy then runs on its own `interval_minutes` |
 | `trader-dashboard` | — | always-on | — |
 
 ## Crypto Detection
 
-`isCrypto(symbol)` strips `-USD`/`/USD` and checks against `CRYPTO_TICKERS` set (50 tickers). Mirrored in `dashboard.mjs` for activation modal schedule display.
+`isCrypto(symbol)` in `markets.mjs` strips `-USD`/`/USD` and checks against `CRYPTO_TICKERS` set (50 tickers). Mirrored in `dashboard.mjs` for activation modal schedule display.
 
 ## Entry Gate & Adaptive Risk (scalpers)
 
-`confirmEntry()` in `trader.mjs` — runs before every new scalper entry, never blocks exits. Fails open on candle fetch errors.
+`confirmEntry()` in `execution.mjs` — runs before every new scalper entry, never blocks exits. Fails open on candle fetch errors.
 
 | Layer | Check | Threshold |
 |---|---|---|
-| L1 RSI band | RSI(14) on strategy interval | LONG: 40–65 · SHORT: 35–60 |
-| L2 EMA50 trend | Price vs EMA(50) | LONG must be above, SHORT below |
 | L3 ATR regime | ATR(14) vs ATR(50) | Block if ATR(14) > 1.5× ATR(50) |
 | L4 BTC macro | BTC 4h candle change | Block if BTC down > 2.5% |
 
-**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct` at entry. See `docs/entry-gate.md` for full tuning guide, threshold rationale, and known limitations.
+L1 (RSI band) and L2 (EMA50) were removed on purpose — they blocked mean-reversion entries. Do not restore without asking.
+
+**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct_adaptive` at entry and cleared on close. The user's `sl_pct` is never overwritten. See `docs/entry-gate.md`.
+
+## Execution Rules (do not regress)
+
+- **Entry order of work:** place order → check fill (`parseFill`) → record trade + TP state → place native stop. A stop failure must never lose the trade record.
+- **Stop fails:** keep the position, raise alert `stop_missing`, `ensureNativeStop()` retries every run.
+- **Position found with no stop and price past the stop level:** place nothing, raise `stop_breached`.
+- **Guards (cooldown, max size) apply to entries only.** Exits are never blocked.
+- **Prices to Hyperliquid go through `formatHlPrice()`** (5 significant figures, `6 − szDecimals` decimals). Never `toPrecision()` — a 6-figure trigger price is rejected as `Invalid TP/SL price`.
+- **Entry orders are not retried** (not idempotent). Closes are.
+- **Scalpers enter on signal + no position, no flip needed.** Signal events are `flip` only when the signal changed.
+- **TP/trail is direction-aware.** `tp_state.high_water` = best price seen (lowest for a short).
+- **Alerts** (`alerts` table) surface as a dashboard banner and desktop notifications.
 
 ## Signal Flow
 
 1. Fetch from `AGENT_SIGNAL_URL/api/strategy/:id/signal` via x402 ($0.01 USDC on Base)
 2. Store in SQLite `signals` table
 3. Compare to prior — if unchanged, hold
-4. If flipped: FLAT→LONG = buy, LONG→FLAT = close, LONG→SHORT = close+short
+4. If flipped: FLAT→LONG = buy, LONG→FLAT = close, LONG→SHORT = close+short, SHORT→LONG = close+long
+5. No trade this run → position upkeep: trail/TP check, then make sure the native stop is resting
 
 ## Hyperliquid Notes
 
@@ -134,10 +161,14 @@ node trader.mjs --stocks-only      # only stock/ETF strategies
 ## SQLite Schema (`data/trader.db`)
 
 ```sql
-strategies (id, name, symbol, leverage, position_size_usd, active, sl_pct, tp_pct, trail_pct, risk_mode)
+strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, last_run_at, active,
+            sl_pct, sl_pct_adaptive, tp_pct, trail_pct, max_size_usd, cooldown_minutes, risk_mode, stop_order_id, …)
 signals    (strategy_id, date, signal, price, notes)  -- UNIQUE(strategy_id, date)
-trades     (strategy_id, date, action, asset, size, price, leverage, pnl, result_json)
+trades     (strategy_id, date, action, asset, size, price, leverage, pnl, result_json, fill_hash)
+alerts     (strategy_id, code, level, message, created_at, resolved_at)  -- one open per strategy+code
 ```
+
+Also: `tp_state`, `signal_events`, `signal_fetches`, `wallets`, `vault_watchlist`, `staking_contracts`, `snapshots`.
 
 - `active` is INTEGER 0/1 (not boolean)
 
@@ -154,4 +185,4 @@ COINGECKO_API_KEY      # optional, for rate limit relief
 
 ## Liquidation Note
 
-Trader executes on signal flips only — no real-time position monitoring. If price moves sharply between runs at leverage, Hyperliquid's engine handles liquidation. The entry gate (L3 ATR regime + L4 BTC macro) reduces the chance of entering into a move that leads to liquidation, but does not prevent it once in a position.
+Trader checks positions only when it runs — no real-time monitoring. Protection between runs is the native stop order on Hyperliquid, when one is resting. If price moves sharply between runs at leverage, Hyperliquid's engine handles liquidation. The entry gate (L3 ATR regime + L4 BTC macro) reduces the chance of entering into a move that leads to liquidation, but does not prevent it once in a position.

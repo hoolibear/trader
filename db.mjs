@@ -6,11 +6,9 @@
 
 import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
-import { resolve, dirname } from "path";
-import { fileURLToPath } from "url";
+import { resolve } from "path";
+import { DATA_DIR } from "./paths.mjs";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = resolve(__dirname, "data");
 mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(resolve(DATA_DIR, "trader.db"));
@@ -137,6 +135,7 @@ try { db.exec("ALTER TABLE strategies ADD COLUMN max_size_usd REAL"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN risk_mode TEXT"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN stop_order_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE strategies ADD COLUMN sl_pct_adaptive REAL"); } catch {}
 
 export function setStrategyRiskMode(id, mode) {
   db.prepare("UPDATE strategies SET risk_mode = ? WHERE id = ?").run(mode ?? null, id);
@@ -146,8 +145,15 @@ export function setStrategySlPct(id, sl_pct) {
   db.prepare("UPDATE strategies SET sl_pct = ? WHERE id = ?").run(sl_pct ?? null, id);
 }
 
+// Stop-loss % computed by the entry gate for the position currently open.
+// Kept apart from sl_pct so the user's own setting is never overwritten.
+// Cleared (null) when the position closes.
+export function setStrategyAdaptiveSl(id, sl_pct) {
+  db.prepare("UPDATE strategies SET sl_pct_adaptive = ? WHERE id = ?").run(sl_pct ?? null, id);
+}
+
 export function setStrategyStopOrderId(id, oid) {
-  db.prepare("UPDATE strategies SET stop_order_id = ? WHERE id = ?").run(oid ?? null, id);
+  db.prepare("UPDATE strategies SET stop_order_id = ? WHERE id = ?").run(oid != null ? String(oid) : null, id);
 }
 
 export function getStrategyStopOrderId(id) {
@@ -618,4 +624,107 @@ export function backfillSnapshotsFromTrades(currentAccountValue) {
       VALUES (datetime(?, '12:00:00'), ?, 0, ?, ?)
     `).run(day.date, running, running - startingValue, running);
   }
+}
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+// Things a human must look at: a position with no stop, a failed payment, a
+// runner that stopped. At most one open alert per (strategy_id, code).
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id TEXT NOT NULL DEFAULT '',
+    code        TEXT NOT NULL,
+    level       TEXT NOT NULL DEFAULT 'warning',
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT
+  )
+`);
+
+// Claude's explanation of an alert (see analyst.mjs)
+try { db.exec("ALTER TABLE alerts ADD COLUMN analysis TEXT"); } catch {}
+try { db.exec("ALTER TABLE alerts ADD COLUMN analysis_at TEXT"); } catch {}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS analyst_calls (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id   INTEGER,
+    model      TEXT,
+    ok         INTEGER NOT NULL DEFAULT 1,
+    ms         INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
+export function getAlert(id) {
+  return db.prepare("SELECT * FROM alerts WHERE id = ?").get(id) ?? null;
+}
+
+export function setAlertAnalysis(id, analysis) {
+  db.prepare("UPDATE alerts SET analysis = ?, analysis_at = datetime('now') WHERE id = ?").run(analysis, id);
+}
+
+/** Latest explanation written for the same strategy + alert code within `hours`. */
+export function getRecentAnalysis(strategy_id, code, hours = 6) {
+  return db.prepare(`
+    SELECT analysis, analysis_at FROM alerts
+    WHERE strategy_id = ? AND code = ? AND analysis IS NOT NULL
+      AND analysis_at >= datetime('now', ?)
+    ORDER BY analysis_at DESC LIMIT 1
+  `).get(strategy_id ?? "", code, `-${Number(hours)} hours`) ?? null;
+}
+
+export function logAnalystCall({ alert_id, model, ok, ms }) {
+  db.prepare("INSERT INTO analyst_calls (alert_id, model, ok, ms) VALUES (?, ?, ?, ?)")
+    .run(alert_id ?? null, model ?? null, ok ? 1 : 0, ms ?? null);
+}
+
+/** Calls made today (UTC), successful or not — what the daily cap counts. */
+export function countAnalystCallsToday() {
+  return db.prepare("SELECT COUNT(*) AS c FROM analyst_calls WHERE date(created_at) = date('now')").get().c;
+}
+
+/**
+ * Open an alert, or refresh the message of the one already open.
+ * @returns {boolean} true when a new alert was created
+ */
+export function raiseAlert({ strategy_id = "", code, message, level = "warning" }) {
+  const open = db.prepare(
+    "SELECT id FROM alerts WHERE strategy_id = ? AND code = ? AND resolved_at IS NULL"
+  ).get(strategy_id ?? "", code);
+  if (open) {
+    db.prepare("UPDATE alerts SET message = ?, level = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(message, level, open.id);
+    return false;
+  }
+  db.prepare("INSERT INTO alerts (strategy_id, code, level, message) VALUES (?, ?, ?, ?)")
+    .run(strategy_id ?? "", code, level, message);
+  return true;
+}
+
+export function resolveAlert(strategy_id, code) {
+  db.prepare(`
+    UPDATE alerts SET resolved_at = datetime('now')
+    WHERE strategy_id = ? AND code = ? AND resolved_at IS NULL
+  `).run(strategy_id ?? "", code);
+}
+
+export function resolveAlertById(id) {
+  db.prepare("UPDATE alerts SET resolved_at = datetime('now') WHERE id = ? AND resolved_at IS NULL").run(id);
+}
+
+export function getOpenAlerts() {
+  return db.prepare(`
+    SELECT a.*, s.name AS strategy_name FROM alerts a
+    LEFT JOIN strategies s ON s.id = a.strategy_id
+    WHERE a.resolved_at IS NULL
+    ORDER BY a.created_at DESC
+  `).all();
+}
+
+/** Alerts created after the given id — used by the desktop app for notifications. */
+export function getAlertsAfter(id = 0) {
+  return db.prepare("SELECT * FROM alerts WHERE id > ? ORDER BY id ASC").all(id);
 }
