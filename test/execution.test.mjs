@@ -333,3 +333,23 @@ test("strategy with no exit rules of its own: server FLAT still closes the posit
   assert.equal(ex.szi, 0);
   assert.match(r.action, /^CLOSED /);
 });
+
+test("sl_fixed: the user's stop is used, no adaptive stop; TP/trail set to 0 stays off", async () => {
+  const s = makeStrategy(db, { sl_pct: 8, tp_pct: 0, trail_pct: 0 });
+  db.setStrategyStopFixed(s.id, true);
+  const ex = new FakeExchange({ mid: 4.0 });
+  ex.getCandles = async () => Array.from({ length: 60 }, () => ({ h: "4.1", l: "3.9", c: "4.0" }));  // adaptive would be 7.5%
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ json: async () => [] });
+  const def = { risk: { mode: "scalp", tp_pct: 15, trail_pct: 2, sl_pct: 5 } };
+  try { await run(s, ex, "LONG", def); } finally { globalThis.fetch = realFetch; }
+  const row = db.getStrategy(s.id);
+  assert.equal(row.sl_pct_adaptive, null, "no adaptive stop stored");
+  assert.ok(Math.abs(ex.stops[0].triggerPrice - 4.0 * 0.92) < 1e-9, "stop at 8%");
+  assert.equal(db.getTpState(s.id) ?? null, null, "no take-profit state");
+  ex.mid = 4.8;                                   // +20%, past the strategy's 15% TP
+  await run(s, ex, "LONG", def);
+  ex.mid = 4.6;                                   // −4% from the high, past a 2% trail
+  await run(s, ex, "LONG", def);
+  assert.ok(ex.szi > 0, "still holding: TP/trail is off");
+});

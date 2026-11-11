@@ -136,6 +136,8 @@ try { db.exec("ALTER TABLE strategies ADD COLUMN cooldown_minutes INTEGER"); } c
 try { db.exec("ALTER TABLE strategies ADD COLUMN risk_mode TEXT"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN stop_order_id TEXT"); } catch {}
 try { db.exec("ALTER TABLE strategies ADD COLUMN sl_pct_adaptive REAL"); } catch {}
+// 1 = always use the user's sl_pct; the entry gate's adaptive stop is not applied
+try { db.exec("ALTER TABLE strategies ADD COLUMN sl_fixed INTEGER NOT NULL DEFAULT 0"); } catch {}
 
 export function setStrategyRiskMode(id, mode) {
   db.prepare("UPDATE strategies SET risk_mode = ? WHERE id = ?").run(mode ?? null, id);
@@ -148,6 +150,10 @@ export function setStrategySlPct(id, sl_pct) {
 // Stop-loss % computed by the entry gate for the position currently open.
 // Kept apart from sl_pct so the user's own setting is never overwritten.
 // Cleared (null) when the position closes.
+export function setStrategyStopFixed(id, fixed) {
+  db.prepare("UPDATE strategies SET sl_fixed = ? WHERE id = ?").run(fixed ? 1 : 0, id);
+}
+
 export function setStrategyAdaptiveSl(id, sl_pct) {
   db.prepare("UPDATE strategies SET sl_pct_adaptive = ? WHERE id = ?").run(sl_pct ?? null, id);
 }

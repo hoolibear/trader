@@ -590,13 +590,15 @@ export async function confirmEntry(strategy, signal, exchange) {
     } catch { /* BTC fetch failed — fail open */ }
 
     // ── Adaptive SL: 1.5×ATR as % of price, clamped [3%, 15%] ──────────
+    // strategies.sl_fixed = 1 keeps the user's own stop: no adaptive stop for that strategy.
+    const fixed = !!strategy.sl_fixed && strategy.sl_pct != null;
     let slPct = strategy.sl_pct ?? 7;
-    if (atr14 != null && price > 0) {
+    if (!fixed && atr14 != null && price > 0) {
       slPct = Math.max(3, Math.min(15, parseFloat((1.5 * atr14 / price * 100).toFixed(2))));
     }
 
-    console.log(`[trader] ✅ Entry gate passed — ATR14/50 ${atr14?.toFixed(4)}/${atr50?.toFixed(4)} | adaptive SL ${slPct.toFixed(2)}%`);
-    return { slPct };
+    console.log(`[trader] ✅ Entry gate passed — ATR14/50 ${atr14?.toFixed(4)}/${atr50?.toFixed(4)} | ${fixed ? "fixed" : "adaptive"} SL ${slPct.toFixed(2)}%`);
+    return { slPct: fixed ? null : slPct };
   } catch (err) {
     console.warn(`[trader] ⚠️  Entry gate error: ${err.message} — allowing entry`);
     return { slPct: strategy.sl_pct }; // fail open

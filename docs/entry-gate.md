@@ -21,6 +21,8 @@ Computed at entry time: `1.5 × ATR(14) / entry_price × 100`, clamped [3%, 15%]
 
 Written to `strategies.sl_pct_adaptive` just before the entry, used for the native stop order on Hyperliquid, and cleared when the position closes. The stop is fixed at the value computed when the position opened, not recalculated. Your own `sl_pct` setting is left untouched and is the fallback when the gate fails open.
 
+**Fixed stop.** `strategies.sl_fixed = 1` turns the adaptive stop off for that strategy; the stop is your `sl_pct`. The L3 and L4 checks still run. Set on NEAR Mean Reversion (8%) on 2026-11-11, with `tp_pct` and `trail_pct` set to 0 so the only exits are its own exit rule and the stop.
+
 **Effect:** calm market → ATR is low → SL tightens to ~3–5%. Volatile market → ATR is high → SL widens to ~8–12%. No manual adjustment needed between market regimes.
 
 The stop is a real order resting on the exchange (reduce-only trigger). `ensureNativeStop()` checks on every run that it is still there and re-places it if not. If it cannot be placed, an alert is raised; see `docs/bugs-to-research.md` item 0.

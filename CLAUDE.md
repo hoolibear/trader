@@ -114,7 +114,7 @@ node trader.mjs --stocks-only      # only stock/ETF strategies
 
 L1 (RSI band) and L2 (EMA50) were removed on purpose — they blocked mean-reversion entries. Do not restore without asking.
 
-**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct_adaptive` at entry and cleared on close. The user's `sl_pct` is never overwritten. See `docs/entry-gate.md`.
+**Adaptive SL:** `1.5 × ATR(14) / price × 100`, clamped [3%, 15%], written to `strategies.sl_pct_adaptive` at entry and cleared on close. The user's `sl_pct` is never overwritten. `strategies.sl_fixed = 1` switches the adaptive stop off for that strategy: the user's `sl_pct` is the stop (set in the DB, no dashboard control yet). A local `tp_pct` / `trail_pct` of `0` switches take-profit and trailing off even when the strategy's risk block on AgentSignal sets them. See `docs/entry-gate.md`.
 
 ## Execution Rules (do not regress)
 
@@ -163,7 +163,7 @@ L1 (RSI band) and L2 (EMA50) were removed on purpose — they blocked mean-rever
 
 ```sql
 strategies (id, name, symbol, leverage, position_size_usd, exchange, interval_minutes, last_run_at, active,
-            sl_pct, sl_pct_adaptive, tp_pct, trail_pct, max_size_usd, cooldown_minutes, risk_mode, stop_order_id, …)
+            sl_pct, sl_fixed, sl_pct_adaptive, tp_pct, trail_pct, max_size_usd, cooldown_minutes, risk_mode, stop_order_id, …)
 signals    (strategy_id, date, signal, price, notes)  -- UNIQUE(strategy_id, date)
 trades     (strategy_id, date, action, asset, size, price, leverage, pnl, result_json, fill_hash)
 alerts     (strategy_id, code, level, message, created_at, resolved_at)  -- one open per strategy+code
